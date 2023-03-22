@@ -1,7 +1,11 @@
 body {
-    background-color: aquamarine;
+    background-color: rgb(16, 13, 43);
+    color: azure;
 }
 
+h1 {
+    align-content: center;
+}
 p {
     color: fuchsia;
     text-align: center;
