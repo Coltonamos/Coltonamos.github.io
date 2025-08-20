@@ -1,1 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Brick Breaker • Compact HUD</title>
+<style>
+/* Theme tokens */
+:root{--bg:#0f172a;--panel:#111827;--accent:#38bdf8;--text:#e5e7eb;--muted:#9ca3af}
+/* Full-viewport centering for an 800×600 fixed play window */
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{display:grid;place-items:center;background:radial-gradient(1200px 800px at 50% 30%,#111827 0%,var(--bg) 60%);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;color:var(--text)}
+/* Game shell is locked to 800×600 (height accounts for 40px HUD + 560px canvas) */
+.shell{width:800px;height:600px;position:relative;background:#0a0f1f;border:1px solid rgba(56,189,248,.35);border-radius:16px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+/* Top HUD with score, level, lives, balls and compact power-up counters */
+.hud{position:absolute;inset:0 0 auto 0;height:40px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:8px 12px;font-size:14px;color:var(--text);background:linear-gradient(180deg,rgba(2,6,23,.7),rgba(2,6,23,.3));border-bottom:1px solid rgba(148,163,184,.15)}
+.hud .left{justify-self:start}.hud .center{justify-self:center;font-weight:700;letter-spacing:.6px;color:var(--accent);text-shadow:0 0 10px rgba(56,189,248,.35)}.hud .right{justify-self:end;display:flex;gap:14px;align-items:center}.badge{font-weight:600;color:var(--muted)}
+/* Compact power-up counter bar (icons + current stack counts) */
+.compact{display:flex;gap:10px;align-items:center;opacity:.95}
+.compact span{display:inline-flex;align-items:center;gap:4px}
+.compact .num{min-width:18px;text-align:right}
+/* Canvas area under HUD */
+.game-area{position:absolute;inset:40px 0 0 0;display:grid;place-items:center}
+canvas{background:#0b1220;display:block;border-radius:10px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.04)}
+/* Overlay is used for pause/game over prompts; avoided on magnet catches */
+.overlay{position:absolute;inset:40px 0 0 0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.6);color:#fff;text-align:center;padding:24px}
+.overlay.show{display:flex}.overlay h2{margin:0 0 .5rem;font-size:1.1rem}.overlay p{margin:0;color:var(--muted)}
+/* Minimum screen gate if viewport < 800×600 */
+.min{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:var(--bg);z-index:50}.min.show{display:flex}.min .card{max-width:560px;margin:24px;padding:24px;border-radius:16px;background:var(--panel);border:1px solid rgba(148,163,184,.2);text-align:center;color:var(--text)}
+</style>
+</head>
+<body>
+<!-- Small-screen message when viewport is smaller than 800×600 -->
+<div id="min" class="min"><div class="card"><h1>please use a bigger screen</h1><p>Requires at least <strong>800×600</strong> viewport.</p></div></div>
 
+<!-- Main fixed-size game window -->
+<div class="shell" role="application" aria-label="Brick Breaker game window">
+  <!-- Heads-up display -->
+  <div class="hud">
+    <div class="left">Score: <span id="score">0</span></div>
+    <div class="center">LEVEL <span id="level">1</span></div>
+    <div class="right">
+      <span class="badge">Lives: <span id="lives">3</span></span>
+      <span class="badge">Balls: <span id="ballCount">1</span></span>
+      <div class="compact" title="Active power-ups">
+        <span>💥<span id="sMulti" class="num">0</span></span>
+        <span>⚪<span id="sBig" class="num">0</span></span>
+        <span>💨<span id="sSpeed" class="num">0</span></span>
+        <span>⬜<span id="sPad" class="num">0</span></span>
+        <span>🧲<span id="sMag" class="num">0</span></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Playfield canvas and overlay layer -->
+  <div class="game-area">
+    <!-- 800×560 canvas (560 = 600 total height − 40 HUD) -->
+    <canvas id="game" width="800" height="560"></canvas>
+    <div id="overlay" class="overlay"><div><h2 id="overlayTitle"></h2><p id="overlayDesc"></p></div></div>
+  </div>
+</div>
+
+<script>
+/*
+  High-level overview
+  - Fixed 800×600 game window centered on the page.
+  - Breakout-style gameplay with 10 levels, varied brick layouts.
+  - Brick types: normal (1+ HP scaling by level) and indestructible (Infinity HP).
+  - Lives start at 3. Ball starts on paddle; Space launches. Paddle may be positioned first.
+  - Power-ups (subset per level):
+    • multi: spawn 20 balls instantly.
+    • bigBall: balls become larger/stronger; each pickup lasts 12s (stackable timers).
+    • speed: doubles speed (stackable), lasts 12s, and spawns +5 balls instantly.
+    • paddle: +50% paddle width per stack.
+    • magnet: catches balls on paddle at hit point; persists across levels; deactivates on life loss. While active, no new magnet drops.
+    • life: spawns from top at random X after ≥75% bricks destroyed (once/level) at 2× fall speed.
+  - Default power-up fall speed is 50% of original; life drops at 2× that.
+*/
+
+/* Canvas and DOM references */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const $score = document.getElementById('score');
+const $lives = document.getElementById('lives');
+const $level = document.getElementById('level');
+const $ballCount = document.getElementById('ballCount');
+const $sMulti = document.getElementById('sMulti');
+const $sBig = document.getElementById('sBig');
+const $sSpeed = document.getElementById('sSpeed');
+const $sPad = document.getElementById('sPad');
+const $sMag = document.getElementById('sMag');
+const overlay = document.getElementById('overlay');
+const overlayTitle = document.getElementById('overlayTitle');
+const overlayDesc = document.getElementById('overlayDesc');
+const minGate = document.getElementById('min');
+
+/* Overlay helpers */
+function showOverlay(t, d){ overlayTitle.textContent = t; overlayDesc.textContent = d; overlay.classList.add('show'); }
+function hideOverlay(){ overlay.classList.remove('show'); }
+
+/* Enforce minimum viewport for the fixed game window */
+function checkScreen(){ const ok = window.innerWidth>=800 && window.innerHeight>=600; minGate.classList.toggle('show', !ok); return ok; }
+window.addEventListener('resize', checkScreen);
+
+/* Pre-render a faint background grid once to an offscreen canvas to avoid per-frame line stroking */
+let gridCanvas, gridCtx;
+function buildGrid(){
+  gridCanvas = document.createElement('canvas');
+  gridCanvas.width = W; gridCanvas.height = H;
+  gridCtx = gridCanvas.getContext('2d');
+  gridCtx.strokeStyle = '#1f2937';
+  gridCtx.beginPath();
+  for(let x=0; x<W; x+=20){ gridCtx.moveTo(x+0.5,0); gridCtx.lineTo(x+0.5,H); }
+  for(let y=0; y<H; y+=20){ gridCtx.moveTo(0,y+0.5); gridCtx.lineTo(W,y+0.5); }
+  gridCtx.stroke();
+}
+
+/* Base tuning values (paddle speed already +20%) */
+const BASE = { ballR:8, paddleW:110, paddleH:14, ballSpeed:5.2, paddleSpeed:8.4 };
+
+/* Global game state */
+let score = 0, lives = 3, level = 1, paused = true;
+/* Stacking modifiers; speed & bigBall use timers; paddle is persistent until life/level reset rules apply */
+let stacks = { bigBall:0, speed:0, bigPaddle:0 };
+/* Magnet persists across levels but turns off on life loss */
+let magnetActive = false;
+/* Per-pickup timers (ms) for bigBall & speed so stacks expire independently */
+let bigBallTimers = [], speedTimers = [];
+/* Level progress tracking for life-drop trigger */
+let bricksStart = 0, destroyedThisLevel = 0, lifeDropSpawned = false;
+
+/* Paddle & collections */
+const paddle = { w:BASE.paddleW, h:BASE.paddleH, x:(W-BASE.paddleW)/2, y:H-28, speed:BASE.paddleSpeed, moveLeft:false, moveRight:false };
+let balls = [];      // Active balls
+let bricks = [];     // Current level bricks
+let powerups = [];   // Falling power-up sprites
+
+/* Update the compact HUD counters */
+function updateCompact(){
+  $sMulti.textContent = Math.max(0, balls.length-1);
+  $sBig.textContent   = stacks.bigBall;
+  $sSpeed.textContent = stacks.speed;
+  $sPad.textContent   = stacks.bigPaddle;
+  $sMag.textContent   = magnetActive ? 1 : 0;
+}
+
+/* Ball factory; speed reflects current speed stack, radius reflects bigBall stack */
+function createBall(x, y, angle, speed){
+  const s = (speed ?? (BASE.ballSpeed * Math.pow(2, stacks.speed)));
+  const r = BASE.ballR * Math.pow(3, stacks.bigBall);
+  return { x, y, vx:s*Math.sin(angle), vy:-Math.abs(s*Math.cos(angle)), r, onPaddle:false };
+}
+
+/* Keep all attached balls aligned to the paddle; each ball may remember its attach offset (ax) */
+function placeAttached(){
+  for(const b of balls) if(b.onPaddle){
+    const ax = (b.ax != null ? b.ax : paddle.w/2);
+    b.x = paddle.x + Math.max(b.r, Math.min(paddle.w-b.r, ax));
+    b.y = paddle.y - b.r - 1;
+  }
+}
+
+/* Launch all attached balls with slight random spread; clears the overlay */
+function launchAttached(){
+  for(const b of balls) if(b.onPaddle){
+    const a = (Math.random()*0.5 - 0.25);
+    const s = BASE.ballSpeed * Math.pow(2, stacks.speed);
+    b.vx = s*Math.sin(a); b.vy = -Math.abs(s*Math.cos(a));
+    b.onPaddle = false;
+  }
+  hideOverlay(); paused = false; updateCompact();
+}
+
+/* Attach a ball at the exact impact point; do not pause or show overlay for magnet catches */
+function attachBall(b){
+  b.onPaddle = true; b.ax = b.x - paddle.x; b.vx = 0; b.vy = 0;
+  placeAttached(); hideOverlay(); updateCompact();
+}
+
+/* Recompute sizes/speeds after stack changes while preserving each ball's movement direction */
+function applyStacks(){
+  paddle.w = BASE.paddleW * (1 + 0.5 * stacks.bigPaddle);
+  paddle.x = Math.max(0, Math.min(W-paddle.w, paddle.x));
+  for(const b of balls){
+    const d = Math.atan2(b.vx, -b.vy);                 // current travel angle
+    const s = BASE.ballSpeed * Math.pow(2, stacks.speed);
+    if(!b.onPaddle){ b.vx = s*Math.sin(d); b.vy = -Math.abs(s*Math.cos(d)); }
+    b.r = BASE.ballR * Math.pow(3, stacks.bigBall);
+  }
+  placeAttached(); updateCompact();
+}
+
+/* Draw a single power-up square with an emoji glyph; glow indicates a drop */
+function drawPowerup(p){
+  ctx.save();
+  ctx.translate(p.x+8, p.y+8);
+  ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2; ctx.shadowColor = '#fde68a'; ctx.shadowBlur = 10;
+  ctx.strokeRect(-8,-8,16,16); ctx.shadowBlur = 0;
+  ctx.fillStyle = '#f3f4f6'; ctx.font = '14px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const icons = { multi:'💥', bigBall:'⚪', speed:'💨', paddle:'⬜', magnet:'🧲', life:'❤️' };
+  ctx.fillText(icons[p.type] || '?', 0, 1);
+  ctx.restore();
+}
+
+/* Activate effect for a collected power-up */
+function activatePowerup(t){
+  if(t==='multi'){
+    const ref = balls[0] || createBall(paddle.x+paddle.w/2, paddle.y-BASE.ballR-1, 0);
+    const ox = ref.x, oy = ref.y; const count = 20;
+    for(let i=0;i<count;i++){ const a = (-0.9 + 1.8*(i/(count-1))) * 0.6; balls.push(createBall(ox,oy,a)); }
+    $ballCount.textContent = balls.length;
+  } else if(t==='bigBall'){
+    stacks.bigBall++; bigBallTimers.push(12000); applyStacks();
+  } else if(t==='speed'){
+    stacks.speed++; speedTimers.push(12000); applyStacks();
+    /* Speed pickup also spawns +5 balls immediately */
+    const ref = balls[0] || createBall(paddle.x+paddle.w/2, paddle.y-BASE.ballR-1, 0);
+    const ox = ref.x, oy = ref.y;
+    for(let i=0;i<5;i++){ const a = (-0.6 + 1.2*(i/4)) * 0.5; balls.push(createBall(ox,oy,a)); }
+    $ballCount.textContent = balls.length;
+  } else if(t==='paddle'){
+    stacks.bigPaddle++; applyStacks();
+  } else if(t==='magnet'){
+    magnetActive = true; hideOverlay(); updateCompact();
+  } else if(t==='life'){
+    lives += 1; $lives.textContent = lives;
+  }
+  updateCompact();
+}
+
+/* Build level bricks with 10 rotating layout patterns; assign up to 5 power-up bricks (≤1 speed) */
+function buildLevel(n){
+  bricks = [];
+  const cols=10, brickW=70, brickH=20, pad=6;
+  const totalWidth = cols*brickW + (cols-1)*pad;
+  const left=(W-totalWidth)/2, top=50;
+  const rows = Math.min(10, 5 + Math.floor(n/2));
+  const mid = (cols-1)/2;
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<cols;c++){
+      let skip=false; const pt=(n-1)%10;              // pattern selector
+      if(pt===1 && ((r+c)%2===0)) skip=true;
+      else if(pt===2 && (r%2===0)) skip=true;
+      else if(pt===3 && (c%3===0)) skip=true;
+      else if(pt===4 && ((r-c)%3===0)) skip=true;
+      else if(pt===5 && (r>Math.floor(rows/2) && c%2===0)) skip=true;
+      else if(pt===6 && (c<Math.floor(r/2) || c>cols-1-Math.floor(r/2))) skip=true;
+      else if(pt===7 && (c<mid-r || c>mid+r)) skip=true;
+      else if(pt===8 && ((c%2===0) && (r%3!==0))) skip=true;
+      else if(pt===9 && (((r*31+c*17+n*13)%5)===0)) skip=true;
+      const steel = n>=4 && ((r+2*c+n)%7===0);        // indestructible gating from level 4
+      if(!skip){ bricks.push({ x:left+c*(brickW+pad), y:top+r*(brickH+pad), w:brickW, h:brickH, alive:true,
+        breakable:!steel, hp: steel? Infinity : 1+Math.floor(n/3), hue: steel?210:200+r*8+c*0.7, powerup:null }); }
+    }
+  }
+  const cand = bricks.filter(b=>b.breakable);
+  // Shuffle candidates for power-ups
+  for(let i=cand.length-1;i>0;i--){ const j=(Math.random()*(i+1))|0; [cand[i],cand[j]]=[cand[j],cand[i]]; }
+  const assign = Math.min(5, cand.length);
+  let types = ['speed','multi','bigBall','paddle'];
+  if(!magnetActive) types.push('magnet');             // don't include magnet if already active globally
+  if(assign > types.length){                          // fill remaining with non-speed repeats
+    const more = magnetActive? ['multi','bigBall','paddle'] : ['multi','bigBall','paddle','magnet'];
+    while(types.length<assign){ types.push(more[types.length % more.length]); }
+  }
+  // Shuffle and assign to first N bricks
+  for(let i=types.length-1;i>0;i--){ const j=(Math.random()*(i+1))|0; [types[i],types[j]]=[types[j],types[i]]; }
+  for(let i=0;i<Math.min(assign,types.length);i++){ cand[i].powerup = types[i]; }
+
+  // Initialize per-level counters
+  bricksStart = cand.length; destroyedThisLevel = 0; lifeDropSpawned = false;
+}
+
+/* Quick check: any breakable bricks left? */
+function breakableRemaining(){ return bricks.some(b=>b.alive && b.breakable); }
+
+/* Reset state for a new life; speed effects clear; magnet deactivates on life loss */
+function resetForLife(){
+  stacks.speed = 0; speedTimers = []; magnetActive = false; applyStacks();
+  balls = [ Object.assign(createBall(paddle.x+paddle.w/2, paddle.y-BASE.ballR-1, 0, 0), { vx:0, vy:0, onPaddle:true, ax:paddle.w/2 }) ];
+  paused = true; placeAttached();
+  showOverlay('Position your paddle, then press Space to launch','Arrow keys or mouse to move • Space to launch / pause');
+  $ballCount.textContent = balls.length; updateCompact();
+}
+
+/* Full restart to level 1 */
+function resetAll(){
+  score=0; lives=3; level=1; stacks={ bigBall:0, speed:0, bigPaddle:0 };
+  bigBallTimers=[]; speedTimers=[]; magnetActive=false;
+  paddle.w=BASE.paddleW; paddle.x=(W-paddle.w)/2;
+  buildLevel(level); powerups=[]; resetForLife();
+  $score.textContent=score; $lives.textContent=lives; $level.textContent=level; updateCompact();
+}
+
+/* Proceed to next level; speed clears; grant +1 life on level 5; magnet persists across level transitions */
+function nextLevel(){
+  level+=1; $level.textContent=level; if(level===5){ lives+=1; $lives.textContent=lives; }
+  stacks.speed=0; speedTimers=[]; applyStacks();
+  buildLevel(level); powerups=[]; resetForLife();
+  magnetActive = true; hideOverlay(); updateCompact();
+}
+
+/* Circle-rectangle collision (clamps circle center to rect) */
+function circleRect(cx,cy,r,rx,ry,rw,rh){
+  const x = Math.max(rx, Math.min(cx, rx+rw));
+  const y = Math.max(ry, Math.min(cy, ry+rh));
+  const dx = cx - x, dy = cy - y;
+  return dx*dx + dy*dy <= r*r;
+}
+
+/* Primary simulation step; dt in ms from requestAnimationFrame */
+function update(dt){
+  // Paddle input & constraints
+  if(paddle.moveLeft)  paddle.x -= paddle.speed;
+  if(paddle.moveRight) paddle.x += paddle.speed;
+  paddle.x = Math.max(0, Math.min(W-paddle.w, paddle.x));
+  if(balls.some(b=>b.onPaddle)) placeAttached();
+  if(paused || !checkScreen()) return;
+
+  // Expiring timers (bigBall/speed) while running; use independent per-pickup timers
+  if(bigBallTimers.length){
+    for(let i=0;i<bigBallTimers.length;i++) bigBallTimers[i]-=dt;
+    const before = bigBallTimers.length;
+    bigBallTimers = bigBallTimers.filter(t=>t>0);
+    const expired = before - bigBallTimers.length;
+    if(expired>0){ stacks.bigBall = Math.max(0, stacks.bigBall - expired); applyStacks(); }
+  }
+  if(speedTimers.length){
+    for(let i=0;i<speedTimers.length;i++) speedTimers[i]-=dt;
+    const before = speedTimers.length;
+    speedTimers = speedTimers.filter(t=>t>0);
+    const expired = before - speedTimers.length;
+    if(expired>0){ stacks.speed = Math.max(0, stacks.speed - expired); applyStacks(); }
+  }
+
+  // Ball physics & paddle bounce (with slight speed gain and angle based on hit position)
+  for(const b of balls){
+    if(b.onPaddle) continue;
+    b.x += b.vx; b.y += b.vy;
+    if(b.x-b.r<0){ b.x=b.r; b.vx*=-1; }
+    if(b.x+b.r>W){ b.x=W-b.r; b.vx*=-1; }
+    if(b.y-b.r<0){ b.y=b.r; b.vy*=-1; }
+    if(b.vy>0 && circleRect(b.x,b.y,b.r, paddle.x,paddle.y,paddle.w,paddle.h)){
+      b.y = paddle.y - b.r;
+      const hit = (b.x - (paddle.x+paddle.w/2)) / (paddle.w/2);
+      const cur = Math.hypot(b.vx,b.vy) * 1.03;                     // tiny acceleration on hit
+      const max = BASE.ballSpeed * Math.pow(2, stacks.speed) * 2;    // speed clamp
+      const sp  = Math.min(cur, max);
+      const ang = hit * (Math.PI/3);
+      b.vx = sp*Math.sin(ang); b.vy = -Math.abs(sp*Math.cos(ang));
+      if(magnetActive) attachBall(b);                                // stick to paddle if magnet
+    }
+  }
+
+  // Brick collisions & damage application
+  const dmg = Math.pow(3, stacks.bigBall);                           // bigBall increases damage exponentially
+  for(const b of balls){
+    if(b.onPaddle) continue;
+    for(const br of bricks){
+      if(!br.alive) continue;
+      if(circleRect(b.x,b.y,b.r, br.x,br.y,br.w,br.h)){
+        const px=b.x-b.vx, py=b.y-b.vy;
+        const ix = px>=br.x && px<=br.x+br.w;
+        // Reflect on the most plausible side based on previous position
+        if(!ix) b.vx*=-1; else b.vy*=-1;
+        if(br.breakable){
+          if(dmg>=br.hp){
+            br.alive=false; score+=1; $score.textContent=score; destroyedThisLevel+=1;
+            // Spawn power-up if present, but never drop magnet while it is already active
+            if(br.powerup && !(br.powerup==='magnet' && magnetActive))
+              powerups.push({ x:br.x+br.w/2-8, y:br.y+br.h/2-8, vy:1, type:br.powerup });
+            // Trigger the once-per-level life drop after 75% of breakables destroyed; falls at 2× speed
+            if(!lifeDropSpawned && bricksStart>0 && destroyedThisLevel>=Math.max(1, Math.ceil(0.75*bricksStart))){
+              const rx = Math.max(8, Math.min(W-24, Math.random()*(W-32)+8));
+              powerups.push({ x:rx, y:-16, vy:2, type:'life' });
+              lifeDropSpawned = true;
+            }
+          } else {
+            br.hp -= dmg;
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  // Advance falling power-ups; default vy=1 (~50% of earlier baseline)
+  for(const p of powerups) p.y += p.vy;
+  // Catch detection; life is applied inline, others route through activator
+  powerups = powerups.filter(p=>{
+    const caught = (p.y+16>=paddle.y && p.y<=paddle.y+paddle.h && p.x+16>=paddle.x && p.x<=paddle.x+paddle.w);
+    if(caught){ if(p.type==='life'){ lives+=1; $lives.textContent=lives; } else activatePowerup(p.type); }
+    return !caught && p.y <= H+20;                                   // drop off the bottom if missed
+  });
+
+  // Remove balls that fell below; keep playing as long as ≥1 remains
+  const before = balls.length;
+  balls = balls.filter(b=> b.y-b.r <= H+2);
+  if(balls.length !== before){ $ballCount.textContent = balls.length; updateCompact(); }
+
+  // Out of balls: lose a life (magnet deactivates inside resetForLife)
+  if(balls.length===0){
+    lives -= 1; $lives.textContent = lives;
+    if(lives<=0){
+      paused = true; showOverlay('Game Over','Press OK to restart');
+      setTimeout(()=>{ if(confirm(`Game over! Final score: ${score}. Play again?`)) resetAll(); }, 50);
+    } else {
+      resetForLife();
+    }
+  }
+
+  // Level clear: proceed or finish campaign
+  if(!breakableRemaining()){
+    paused = true;
+    if(level>=10){
+      showOverlay('You Win!','All 10 levels cleared. Press OK to restart.');
+      setTimeout(()=>{ if(confirm(`Victory! Final score: ${score}. Play again from Level 1?`)) resetAll(); }, 50);
+    } else {
+      showOverlay(`Level ${level} cleared!`, 'Press Space to continue');
+      setTimeout(()=>{ nextLevel(); }, 300);
+    }
+  }
+}
+
+/* Render step */
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  if(gridCanvas){ ctx.save(); ctx.globalAlpha=0.2; ctx.drawImage(gridCanvas,0,0); ctx.restore(); }
+  // Bricks (gradient for breakables; dull slab for steel)
+  for(const br of bricks){
+    if(!br.alive) continue;
+    if(!br.breakable){
+      ctx.fillStyle = '#334155'; ctx.fillRect(br.x,br.y,br.w,br.h);
+      ctx.strokeStyle = 'rgba(148,163,184,.35)'; ctx.strokeRect(br.x+.5,br.y+.5,br.w-1,br.h-1);
+      continue;
+    }
+    const g = ctx.createLinearGradient(br.x,br.y,br.x,br.y+br.h);
+    g.addColorStop(0,`hsl(${br.hue},80%,55%)`); g.addColorStop(1,`hsl(${br.hue},70%,45%)`);
+    ctx.fillStyle = g; ctx.fillRect(br.x,br.y,br.w,br.h);
+    if(br.powerup){ ctx.save(); ctx.strokeStyle='#fbbf24'; ctx.shadowColor='#fde68a'; ctx.shadowBlur=12; ctx.strokeRect(br.x+.5,br.y+.5,br.w-1,br.h-1); ctx.restore(); }
+    else { ctx.strokeStyle='rgba(255,255,255,.12)'; ctx.strokeRect(br.x+.5,br.y+.5,br.w-1,br.h-1); }
+  }
+  for(const p of powerups) drawPowerup(p);
+  // Paddle
+  ctx.fillStyle='#38bdf8'; ctx.fillRect(paddle.x,paddle.y,paddle.w,paddle.h);
+  // Balls
+  ctx.fillStyle='#f8fafc'; ctx.strokeStyle='rgba(56,189,248,.6)';
+  for(const b of balls){ ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,Math.PI*2); ctx.closePath(); ctx.fill(); ctx.stroke(); }
+}
+
+/* RAF-driven game loop with dt in milliseconds */
+let last = performance.now();
+function loop(ts){ const dt = ts - last; last = ts; update(dt); draw(); requestAnimationFrame(loop); }
+
+/* Input: click overlay to continue; Space toggles pause or launches; arrows move paddle; mouse moves paddle */
+overlay.addEventListener('click', ()=>{ if(balls.some(b=>b.onPaddle)) launchAttached(); else { paused=!paused; paused?showOverlay('Paused','Press Space or Click to resume'):hideOverlay(); } });
+window.addEventListener('keydown', e=>{
+  if(e.code==='ArrowLeft') paddle.moveLeft=true;
+  if(e.code==='ArrowRight') paddle.moveRight=true;
+  if(e.code==='Space'){
+    if(balls.some(b=>b.onPaddle)) launchAttached();
+    else { paused=!paused; paused?showOverlay('Paused','Press Space to resume'):hideOverlay(); }
+    e.preventDefault();
+  }
+});
+window.addEventListener('keyup', e=>{ if(e.code==='ArrowLeft') paddle.moveLeft=false; if(e.code==='ArrowRight') paddle.moveRight=false; });
+canvas.addEventListener('mousemove', e=>{ const r=canvas.getBoundingClientRect(); const mx=e.clientX-r.left; paddle.x=Math.max(0,Math.min(W-paddle.w,mx-paddle.w/2)); placeAttached(); });
+
+/* Bootstrap game */
+buildGrid();
+resetAll();
+showOverlay('Position your paddle, then press Space to launch','Arrow keys or mouse to move • Space to launch / pause');
+checkScreen();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
